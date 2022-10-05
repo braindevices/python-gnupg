@@ -860,6 +860,12 @@ VERSION_RE = re.compile(r'gpg \(GnuPG(?:/MacGPG2)?\) (\d+(\.\d+)*)'.encode('asci
 HEX_DIGITS_RE = re.compile(r'[0-9a-f]+$', re.I)
 PUBLIC_KEY_RE = re.compile(r'gpg: public key is (\w+)')
 
+def is_valid_outfile(fileobj):
+    write_op = getattr(fileobj, "write", None)
+    return callable(write_op)
+
+def assert_valid_outfile(fileobj):
+    assert is_valid_outfile(fileobj), "fileobj must have `write` method"
 
 class GPG(object):
 
@@ -1058,7 +1064,7 @@ class GPG(object):
         else:
             result.data = ''.join(chunks)
 
-    def _collect_output(self, process, result, writer=None, stdin=None):
+    def _collect_output(self, process, result, writer=None, stdin=None, out_fileobj=None):
         """
         Drain the subprocesses output streams, writing the collected output
         to the result. If a writer thread (writing to the subprocess) is given,
@@ -1070,12 +1076,15 @@ class GPG(object):
         rr.daemon = True
         logger.debug('stderr reader: %r', rr)
         rr.start()
-
         stdout = process.stdout
-        dr = threading.Thread(target=self._read_data, args=(stdout, result, self.on_data))
-        dr.daemon = True
-        logger.debug('stdout reader: %r', dr)
-        dr.start()
+        if out_fileobj is not None:
+            logger.debug("read stdout to output fileobj")
+            dr = _threaded_copy_data(stdout, out_fileobj)
+        else:
+            dr = threading.Thread(target=self._read_data, args=(stdout, result, self.on_data))
+            dr.daemon = True
+            logger.debug('stdout reader: %r', dr)
+            dr.start()
 
         dr.join()
         rr.join()
@@ -1111,11 +1120,13 @@ class GPG(object):
             result = open(fileobj_or_path, 'rb')
         return result
 
-    def _handle_io(self, args, fileobj_or_path, result, passphrase=None, binary=False):
+    def _handle_io(self, args, fileobj_or_path, result, out_fileobj=None, passphrase=None, binary=False):
         "Handle a call to GPG - pass input data, collect output data"
         # Handle a basic data call - pass data to GPG, handle the output
         # including status information. Garbage In, Garbage Out :)
         fileobj = self._get_fileobj(fileobj_or_path)
+        assert_valid_outfile(out_fileobj)
+        writer = None
         try:
             p = self._open_subprocess(args, passphrase is not None)
             if not binary:  # pragma: no cover
@@ -1125,10 +1136,11 @@ class GPG(object):
             if passphrase:
                 _write_passphrase(stdin, passphrase, self.encoding)
             writer = _threaded_copy_data(fileobj, stdin)
-            self._collect_output(p, result, writer, stdin)
+            self._collect_output(p, result, writer, stdin, out_fileobj=out_fileobj)
             return result
         finally:
-            writer.join(0.01)
+            if writer:
+                writer.join(0.01)
             if fileobj is not fileobj_or_path:
                 fileobj.close()
     #
@@ -1767,14 +1779,23 @@ class GPG(object):
         if passphrase and not self.is_valid_passphrase(passphrase):
             raise ValueError('Invalid passphrase')
         args = ['--decrypt']
-        if output:  # write the output to a file with the specified name
+        out_fileobj = None
+        logger.debug("output is {}".format(output))
+        if output is None:
+            pass
+        elif isinstance(output, path_types):  # write the output to a file with the specified name
             self.set_output_without_confirmation(args, output)
+        elif is_valid_outfile(output):
+            logger.debug("output is file-like object")
+            out_fileobj = output
+        else:
+            raise RuntimeError("unsupported output type: {}".format(type(output)))
         if always_trust:  # pragma: no cover
             args.append('--always-trust')
         if extra_args:
             args.extend(extra_args)
         result = self.result_map['crypt'](self)
-        self._handle_io(args, fileobj_or_path, result, passphrase, binary=True)
+        self._handle_io(args, fileobj_or_path, result, out_fileobj=out_fileobj, passphrase=passphrase, binary=True)
         logger.debug('decrypt result[:100]: %r', result.data[:100])
         return result
 
